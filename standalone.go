@@ -265,13 +265,60 @@ retry:
 }
 
 func (s *standalone) DoStream(ctx context.Context, cmd Completed) RedisResultStream {
-	var stream RedisResultStream
-	if s.toReplicas != nil && s.toReplicas(cmd) {
-		stream = s.pick(cmd.Slot()).DoStream(ctx, cmd)
-	} else {
-		stream = s.primary.Load().DoStream(ctx, cmd)
+	if !s.enableRedirect {
+		return s.routeStream(ctx, cmd)
 	}
+	// Pinned so the inner client does not recycle the command: following a
+	// REDIRECT needs it intact. The hook recycles it with PutCompletedForce
+	// once no further attempt can happen, the same way Do does.
+	cmd = cmd.Pin()
+	stream := s.routeStream(ctx, cmd)
+	if stream.e != nil {
+		// Nothing was sent, so there is no reply to redirect and no reason to
+		// hold the command. WriteTo returns early on an already failed stream
+		// without ever reaching the hook, and the pin keeps the inner client
+		// from recycling it, so this is the only place left to do it.
+		cmds.PutCompletedForce(cmd)
+		return stream
+	}
+	stream.redirect = s.streamRedirect(ctx, cmd)
 	return stream
+}
+
+func (s *standalone) routeStream(ctx context.Context, cmd Completed) RedisResultStream {
+	if s.toReplicas != nil && s.toReplicas(cmd) {
+		return s.pick(cmd.Slot()).DoStream(ctx, cmd)
+	}
+	return s.primary.Load().DoStream(ctx, cmd)
+}
+
+// streamRedirect returns the hook RedisResultStream uses to follow a Valkey
+// REDIRECT, mirroring the loop in standalone.Do: handleRedirect re-points the
+// primary, then the command is re-issued through the usual routing. The hook
+// installs itself on each fresh stream so the attempt counter accumulates.
+func (s *standalone) streamRedirect(ctx context.Context, cmd Completed) func(error) (RedisResultStream, bool) {
+	attempts := 1
+	var self func(error) (RedisResultStream, bool)
+	self = func(err error) (RedisResultStream, bool) {
+		if redirectErr, ok := s.handleRedirect(ctx, err); ok {
+			if redirectErr == nil || s.retryer.WaitOrSkipRetry(ctx, attempts, cmd, err) {
+				attempts++
+				next := s.routeStream(ctx, cmd)
+				if next.e != nil {
+					// The re-issue never reached the wire: recycle the command
+					// here, since WriteTo returns on the errored stream without
+					// calling the hook again.
+					cmds.PutCompletedForce(cmd)
+					return next, true
+				}
+				next.redirect = self
+				return next, true
+			}
+		}
+		cmds.PutCompletedForce(cmd) // no further attempt, so the command can go back
+		return RedisResultStream{}, false
+	}
+	return self
 }
 
 func (s *standalone) DoMultiStream(ctx context.Context, multi ...Completed) MultiRedisResultStream {

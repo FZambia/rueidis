@@ -3,6 +3,9 @@ package mock
 import (
 	"bytes"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"reflect"
 	"strings"
@@ -214,5 +217,93 @@ func TestMultiResultStream(t *testing.T) {
 		if err := s.Error(); err != io.EOF {
 			t.Fatalf("unexpected value %v", err)
 		}
+	}
+}
+
+// The pipe here is allocated from mock's definition but read and written by
+// rueidis at the offsets of rueidis.pipe, so a field added to one and not the
+// other silently misaligns everything behind it and pushes the tail fields past
+// the end of this allocation. That is memory corruption with no build error and
+// no obvious symptom, so compare the two definitions field by field. The types
+// deliberately differ where mock cannot name an unexported one (queue, subs,
+// CacheStore); every substitute is the same width, so the names in order are
+// what has to match.
+func TestPipeMirrorsRueidisPipe(t *testing.T) {
+	const src = "../pipe.go" // reachable through the replace directive in go.mod
+	f, err := parser.ParseFile(token.NewFileSet(), src, nil, 0)
+	if err != nil {
+		t.Skipf("cannot read %s: %v", src, err)
+	}
+
+	var want []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		ts, ok := n.(*ast.TypeSpec)
+		if !ok || ts.Name.Name != "pipe" {
+			return true
+		}
+		st, ok := ts.Type.(*ast.StructType)
+		if !ok {
+			return false
+		}
+		for _, field := range st.Fields.List {
+			for _, name := range field.Names {
+				want = append(want, name.Name)
+			}
+		}
+		return false
+	})
+	if len(want) == 0 {
+		t.Fatalf("no rueidis.pipe fields found in %s", src)
+	}
+
+	got := make([]string, 0, len(want))
+	for i, typ := 0, reflect.TypeOf(pipe{}); i < typ.NumField(); i++ {
+		got = append(got, typ.Field(i).Name)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mock.pipe has drifted from rueidis.pipe\n mock: %v\nrueidis: %v", got, want)
+	}
+}
+
+// TestPoolMirrorsRueidisPool guards the mock pool against the same silent
+// misalignment TestPipeMirrorsRueidisPipe guards the pipe against: the mock
+// stream stores its wire back into a *pool via an unsafe cast, so a reordered
+// field would corrupt memory with no build error. Compare the field names in
+// order; the substitute types (wire -> any, and the make/list element types)
+// are the same width.
+func TestPoolMirrorsRueidisPool(t *testing.T) {
+	const src = "../pool.go" // reachable through the replace directive in go.mod
+	f, err := parser.ParseFile(token.NewFileSet(), src, nil, 0)
+	if err != nil {
+		t.Skipf("cannot read %s: %v", src, err)
+	}
+
+	var want []string
+	ast.Inspect(f, func(n ast.Node) bool {
+		ts, ok := n.(*ast.TypeSpec)
+		if !ok || ts.Name.Name != "pool" {
+			return true
+		}
+		st, ok := ts.Type.(*ast.StructType)
+		if !ok {
+			return false
+		}
+		for _, field := range st.Fields.List {
+			for _, name := range field.Names {
+				want = append(want, name.Name)
+			}
+		}
+		return false
+	})
+	if len(want) == 0 {
+		t.Fatalf("no rueidis.pool fields found in %s", src)
+	}
+
+	got := make([]string, 0, len(want))
+	for i, typ := 0, reflect.TypeOf(pool{}); i < typ.NumField(); i++ {
+		got = append(got, typ.Field(i).Name)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mock.pool has drifted from rueidis.pool\n mock: %v\nrueidis: %v", got, want)
 	}
 }
