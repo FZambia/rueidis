@@ -111,7 +111,11 @@ func RedisResultStream(ms ...rueidis.RedisMessage) rueidis.RedisResultStream {
 		pm := *(*message)(unsafe.Pointer(&m))
 		serialize(pm, buf)
 	}
-	s := stream{n: len(ms), p: &pool{size: 1, cond: sync.NewCond(&sync.Mutex{})}, w: &pipe{r: bufio.NewReader(buf)}}
+	// version 6 so that the mirrored pipe reports RESP3, which is what
+	// rueidis.RedisResultStream.Walk keys its protocol decision on. Left at the
+	// zero value it reads as RESP2 and every mocked Walk is refused with
+	// ErrWalkRESP3Required without the callback ever running.
+	s := stream{n: len(ms), p: &pool{size: 1, cond: sync.NewCond(&sync.Mutex{})}, w: &pipe{r: bufio.NewReader(buf), version: 6}}
 	return *(*rueidis.RedisResultStream)(unsafe.Pointer(&s))
 }
 
@@ -176,6 +180,13 @@ type pool struct {
 	timerOn bool
 }
 
+// pipe mirrors rueidis.pipe. The streams built here point at a pipe allocated
+// from this definition, but rueidis reads and writes it at the offsets of its
+// own, so the two must stay identical field for field. When they drift, every
+// field past the first difference is accessed at the wrong offset and the tail
+// ones land outside this allocation altogether — silent memory corruption, not
+// a build failure. rueidis.pipe is unexported, so its layout cannot be asserted
+// at compile time from here; TestPipeMirrorsRueidisPipe is what catches drift.
 type pipe struct {
 	conn            net.Conn
 	clhks           atomic.Value // closed hook, invoked after the conn is closed
@@ -192,8 +203,10 @@ type pipe struct {
 	psubs           *any // pubsub pmessage subscriptions
 	r2p             *any
 	pingTimer       *time.Timer // timer for background ping
+	authTimer       *time.Timer // timer for refreshing dynamic auth credentials
 	lftmTimer       *time.Timer // lifetime timer
 	info            map[string]rueidis.RedisMessage
+	authRefreshAt   atomic.Pointer[time.Time]
 	timeout         time.Duration
 	pinggap         time.Duration
 	maxFlushDelay   time.Duration
