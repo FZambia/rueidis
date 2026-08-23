@@ -192,8 +192,10 @@ type pipe struct {
 	psubs           *any // pubsub pmessage subscriptions
 	r2p             *any
 	pingTimer       *time.Timer // timer for background ping
+	authTimer       *time.Timer // timer for refreshing dynamic auth credentials
 	lftmTimer       *time.Timer // lifetime timer
 	info            map[string]rueidis.RedisMessage
+	authRefreshAt   atomic.Pointer[time.Time]
 	timeout         time.Duration
 	pinggap         time.Duration
 	maxFlushDelay   time.Duration
@@ -209,11 +211,21 @@ type pipe struct {
 }
 
 type stream struct {
-	p *pool
-	w *pipe
-	e error
-	n int
+	p        *pool
+	w        *pipe
+	e        error
+	redirect func(error) (rueidis.RedisResultStream, bool)
+	n        int
 }
+
+// The casts above copy exactly unsafe.Sizeof(rueidis.RedisResultStream{})
+// bytes out of a stream value, so the two layouts must match field for field.
+// These blow up the build on any size drift, instead of letting the cast read
+// past the mirror and hand the garbage to the garbage collector, which shows
+// up as "fatal error: invalid pointer found on stack" only under memory
+// pressure.
+var _ [unsafe.Sizeof(rueidis.RedisResultStream{}) - unsafe.Sizeof(stream{})]byte
+var _ [unsafe.Sizeof(stream{}) - unsafe.Sizeof(rueidis.RedisResultStream{})]byte
 
 type errs struct{ error }
 

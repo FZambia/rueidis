@@ -1447,8 +1447,103 @@ func (c *clusterClient) DoStream(ctx context.Context, cmd Completed) RedisResult
 		return NewErrorResultStream(err)
 	}
 	ret := cc.DoStream(ctx, cmd)
-	cmds.PutCompleted(cmd)
+	if ret.e != nil {
+		// Nothing was sent, so there is no reply to redirect and no reason to
+		// hold the command. WriteTo returns early on an already failed stream
+		// without ever reaching the hook, so recycling has to happen here or it
+		// never happens at all.
+		cmds.PutCompleted(cmd)
+		return ret
+	}
+	// The command is not recycled here: a MOVED or ASK reply is only seen when
+	// the caller reads, and re-issuing it then needs the command intact. The
+	// redirector releases it once no further attempt can happen.
+	ret.redirect = c.streamRedirect(ctx, cmd, cc)
 	return ret
+}
+
+// streamRedirect returns the hook RedisResultStream uses to follow a cluster
+// redirect. It follows the same logic as clusterClient.do, except that each
+// attempt hands back a fresh stream rather than a result, and that it tracks the
+// current connection as the prev passed to redirectOrNew (see cc = ncc below)
+// rather than keeping the original pick across hops as do does.
+func (c *clusterClient) streamRedirect(ctx context.Context, cmd Completed, cc conn) func(error) (RedisResultStream, bool) {
+	attempts, redirects := 1, 0
+	// The hook installs itself on each fresh stream rather than a new closure,
+	// so the attempt and redirect counters accumulate across hops. Handing out
+	// a new closure would reset them and let a node that keeps redirecting loop
+	// forever.
+	var self func(error) (RedisResultStream, bool)
+	self = func(err error) (RedisResultStream, bool) {
+		addr, mode := c.shouldRefreshRetry(err, ctx)
+		switch mode {
+		case RedirectMove, RedirectAsk:
+			redirects++
+			if limit := c.opt.ClusterOption.MaxMovedRedirections; limit > 0 && redirects > limit {
+				cmds.PutCompleted(cmd)
+				return RedisResultStream{}, false
+			}
+			ncc := c.redirectOrNew(addr, cc, cmd.Slot(), mode)
+			// Track the current conn as prev for the next hop. do keeps the
+			// original pick instead; the difference only affects redirectOrNew's
+			// "MOVED points at a node we already hold -> reconnect" heuristic and
+			// is bounded by MaxMovedRedirections either way.
+			cc = ncc
+			if mode == RedirectMove {
+				next := ncc.DoStream(ctx, cmd)
+				if next.e != nil {
+					// The re-issue never reached the wire: recycle the command
+					// here, since WriteTo returns on the errored stream without
+					// calling the hook again.
+					cmds.PutCompleted(cmd)
+					return next, true
+				}
+				next.redirect = self
+				return next, true
+			}
+			// ASKING is only meaningful on the connection carrying the command,
+			// so both go out together and its reply is dropped before the
+			// stream is handed back positioned at the one that matters.
+			next := ncc.DoMultiStream(ctx, cmds.AskingCmd, cmd)
+			if e := next.discardOne(); e != nil {
+				// Transport failure while dropping the ASKING reply: the
+				// stream position is unknown, nothing can continue.
+				cmds.PutCompleted(cmd)
+				return NewErrorResultStream(e), true
+			}
+			next.redirect = self
+			return next, true
+		case RedirectRetry:
+			if !c.retry || !cmd.IsRetryable() {
+				break
+			}
+			if !c.retryHandler.WaitOrSkipRetry(ctx, attempts, cmd, err) {
+				break
+			}
+			attempts++
+			ncc, perr := c.pick(ctx, cmd.Slot(), c.toReplica(cmd))
+			if perr != nil {
+				// Surface why the retry could not be routed, the way
+				// clusterClient.do returns the pick error rather than the reply
+				// that prompted the retry. Swallowing it leaves the caller
+				// looking at a TRYAGAIN when the real problem is that the slot
+				// has no node.
+				cmds.PutCompleted(cmd)
+				return NewErrorResultStream(perr), true
+			}
+			cc = ncc
+			next := ncc.DoStream(ctx, cmd)
+			if next.e != nil {
+				cmds.PutCompleted(cmd)
+				return next, true
+			}
+			next.redirect = self
+			return next, true
+		}
+		cmds.PutCompleted(cmd) // no further attempt, so the command can go back
+		return RedisResultStream{}, false
+	}
+	return self
 }
 
 func (c *clusterClient) DoMultiStream(ctx context.Context, multi ...Completed) MultiRedisResultStream {

@@ -1294,7 +1294,12 @@ type RedisResultStream struct {
 	p *pool
 	w *pipe
 	e error
-	n int
+	// redirect re-issues the command behind this stream when the reply turns
+	// out to be a cluster redirect, returning a fresh stream to continue from.
+	// Only clusterClient.DoStream sets it, and only for a single command, since
+	// a partially consumed multi command stream cannot be re-issued.
+	redirect func(error) (RedisResultStream, bool)
+	n        int
 }
 
 // HasNext can be used in a for loop condition to check if a further WriteTo call is needed.
@@ -1311,14 +1316,36 @@ func (s *RedisResultStream) Error() error {
 // WriteTo reads a redis response from redis and then write it to the given writer.
 // This function is not thread-safe and should be called sequentially to read multiple responses.
 // An io.EOF error will be reported if all responses are read.
+//
+// Against a cluster, a MOVED or ASK reply is followed transparently: streamTo
+// reports an error response before writing anything, so the command can be
+// re-issued on the right node without w having seen a partial result.
 func (s *RedisResultStream) WriteTo(w io.Writer) (n int64, err error) {
-	if err = s.e; err == nil && s.n > 0 {
+	for {
+		if s.e != nil || s.n <= 0 {
+			return 0, s.e
+		}
+		// done tracks whether THIS attempt finished its stream, so it is scoped
+		// to one iteration: after a redirect the loop continues on a fresh
+		// stream, and carrying the previous attempt's value over would release
+		// the command while the new stream is still live.
+		var done bool
 		var clean bool
 		if n, err, clean = streamTo(s.w.r, w); !clean {
 			s.e = err // err must not be nil in case of !clean
 			s.n = 1
 		}
+		// Only a reply that produced no output can be replaced by another one,
+		// and only when redis itself said so: redirects, TRYAGAIN and friends
+		// are all redis errors. A client side error, such as streamTo not
+		// supporting the reply type, must surface rather than re-issue the
+		// command, which would fetch the same unsupported reply forever.
+		var again bool
+		if re, ok := err.(*RedisError); ok && re != Nil {
+			again = clean && n == 0 && s.redirect != nil
+		}
 		if s.n--; s.n == 0 {
+			done = true
 			atomic.AddInt32(&s.w.blcksig, -1)
 			s.w.decrWaits()
 			if s.e == nil {
@@ -1328,8 +1355,47 @@ func (s *RedisResultStream) WriteTo(w io.Writer) (n int64, err error) {
 			}
 			s.p.Store(s.w)
 		}
+		if again {
+			if next, ok := s.redirect(err); ok {
+				*s = next
+				continue
+			}
+		} else if done && s.redirect != nil {
+			// Nothing further will be attempted, so let the hook release the
+			// command it was holding for a possible retry. A nil error never
+			// redirects.
+			s.redirect(nil)
+		}
+		return n, err
 	}
-	return n, err
+}
+
+// discardOne consumes one response and drops it, so that a stream carrying a
+// prelude such as ASKING can be handed on positioned at the reply that matters.
+// The content of the dropped reply is ignored, error replies included, exactly
+// as clusterClient.do ignores the ASKING reply: if the prelude failed, the
+// command reply right behind it tells the retry logic everything it needs.
+// Only a transport error is fatal, since the stream position is unknown then.
+func (s *RedisResultStream) discardOne() error {
+	if s.e != nil || s.n <= 0 {
+		return s.e
+	}
+	_, err := syncRead(s.w.r)
+	if err != nil {
+		s.e = err
+		s.n = 1
+	}
+	if s.n--; s.n == 0 {
+		atomic.AddInt32(&s.w.blcksig, -1)
+		s.w.decrWaits()
+		if s.e == nil {
+			s.e = io.EOF
+		} else {
+			s.w.Close()
+		}
+		s.p.Store(s.w)
+	}
+	return err
 }
 
 func (p *pipe) DoStream(ctx context.Context, pool *pool, cmd Completed) RedisResultStream {
